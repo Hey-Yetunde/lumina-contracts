@@ -61,7 +61,6 @@ fn set_tags(caller: Address, contract_id: Address, tags: Vec<Symbol>) -> Result<
 fn stake(owner: Address, contract_id: Address, amount: I28) -> Result<(), RegistryError>
 fn transfer_ownership(caller: Address, contract_id: Address, new_owner: Address) -> Result<(), RegistryError>
 fn update_metadata(caller: Address, contract_id: Address, name: String, description: String) -> Result<(), RegistryError>
-fn upgrade(admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), RegistryError>
 fn withdraw_stake(owner: Address, contract_id: Address) -> Result<I128, RegistryError>
 struct Attestation { attester: Address, created_at: U32, label: String }
 struct ContractEntry { active: Bool, contract_id: Address, description: String, name: String, owner: Address, registered_at: U32 }
