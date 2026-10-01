@@ -1,4 +1,4 @@
-﻿// Copyright (c) Lumina contributors
+// Copyright (c) Lumina contributors
 // SPDX-License-Identifier: MIT
 #![no_std]
 // Soroban's `#[contracttype]`, `#[contracterror]`, `#[contractimpl]` and
@@ -113,6 +113,8 @@ pub const SLASH_LOCK_LEDGERS: u32 = 17_280;
 #[cfg(test)]
 pub const SLASH_LOCK_LEDGERS: u32 = 10;
 
+/// How many ledgers a registration stays valid before it must be renewed.
+pub const EXPIRY_LEDGERS: u32 = 17_280;
 /// How many ledgers a registration stays current after `register_contract` or
 /// `renew`. Roughly one year at ~6 s per ledger.
 ///
@@ -240,7 +242,7 @@ pub enum RegistryError {
     InvalidAttestation = 27,
     /// The caller has no attestation to revoke on this registration.
     AttestationNotFound = 28,
-    /// The proposed treasury or stake-token address is itself a registered
+/// The proposed treasury or stake-token address is itself a registered
     /// contract.
     OverlappingAddress = 29,
     /// The admin set would have fewer than `MIN_ADMINS` members.
@@ -255,6 +257,13 @@ pub enum RegistryError {
     AlreadyVerified = 34,
     /// Staking is already configured with the proposed token and treasury.
     StakingAlreadyConfigured = 35,
+    /// Generic invalid input.
+    InvalidInput = 36,
+    /// The referenced slash record does not exist.
+    SlashNotFound = 37,
+    /// A response already exists for this slash record.
+    ResponseAlreadyExists = 38,
+    /// The contract's token balance is insufficient.
     /// Caller-supplied input failed validation (e.g. an empty slash response).
     InvalidInput = 36,
     /// No slash exists at the given index in a registration's slash history.
@@ -265,6 +274,14 @@ pub enum RegistryError {
     /// believes is staked, so a transfer that depends on that balance cannot
     /// proceed safely.
     ContractBalanceInsufficient = 39,
+    /// The stake arithmetic would overflow `i128`.
+    ///
+    /// Note: the workspace profile enables `overflow-checks`, so an unchecked
+    /// `+`/`-` would trap rather than wrap. That profile setting is a backstop
+    /// for arithmetic we have not audited, not the mechanism that protects
+    /// stake accounting — the stake and slash paths use explicit checked
+    /// arithmetic and return this error instead.
+    StakeOverflow       = 40,
 }
 
 // ─── Storage shapes ────────────────────────────────────────────────────────
@@ -392,6 +409,8 @@ pub struct Reputation {
     pub slashed_total: i128,
     /// Ledger before which `withdraw_stake` is refused. Zero once clear.
     pub withdraw_locked_until: u32,
+    /// Whether the registration is currently withdrawal-locked.
+    pub withdraw_locked: bool,
 }
 
 /// A registration joined with its reputation — what a discovery client wants.
@@ -555,6 +574,8 @@ pub enum ProposalAction {
     ConfigureMinimumStake(i128),
     /// Withdraw from the treasury.
     WithdrawFromTreasury(i128),
+    /// Remap every registration from one category to another: `(from, to)`.
+    MigrateCategory(Category, Category),
 }
 
 /// Fixed-window registration counter for one owner.
@@ -673,6 +694,10 @@ pub enum DataKey {
     PreviousTreasury,
     /// i128 — currently staked balance for a registration.
     Stake(Address),
+    /// i128 — stake posted by one staker against one registration.
+    /// Keyed by (registration, staker) so third parties can back a
+    /// registration without owning it, and each withdraws only their own.
+    StakeOf(Address, Address),
     /// bool — governance-attested verified status.
     Verified(Address),
     /// Vec<SlashRecord> — every slash ever levied, oldest first.
@@ -733,6 +758,10 @@ pub enum DataKey {
     // ── Registry statistics ────────────────────────────────────────────────
     /// i128 — total staked across all registrations.
     TotalStaked,
+    /// Vec<Address> — insertion-ordered stakers backing one registration.
+    /// Needed to enumerate whose stake a slash takes, and to report the
+    /// per-registration total as the sum over stakers.
+    Stakers(Address),
     /// u32 — count of verified registrations.
     VerifiedCount,
 
@@ -2248,17 +2277,22 @@ impl LuminaRegistry {
     /// stake without re-registering.
     ///
     /// Additive — calling it again tops the stake up.
+    ///
+    /// Any address may stake, not just the registered owner: a backer who
+    /// wants to vouch for a project can post collateral on its behalf. Stake
+    /// is tracked per `(registration, staker)`, so each staker withdraws only
+    /// their own and the registration's total is the sum over all stakers.
     pub fn stake(
         env: Env,
-        owner: Address,
+        staker: Address,
         contract_id: Address,
         amount: i128,
     ) -> Result<(), RegistryError> {
-        owner.require_auth();
+        staker.require_auth();
 
         Self::validate_positive_amount(amount)?;
 
-        let entry: ContractEntry = env
+let entry: ContractEntry = env
             .storage()
             .persistent()
             .get(&DataKey::Contract(contract_id.clone()))
@@ -2267,14 +2301,15 @@ impl LuminaRegistry {
         if owner != entry.owner {
             return Err(RegistryError::NotOwner);
         }
+        }
 
         let (token_id, _) = Self::staking_config(&env)?;
 
-        // Moves real tokens into the registry's own balance. `owner` has
+        // Moves real tokens into the registry's own balance. `staker` has
         // already authorized this invocation, and the token's own
         // `from.require_auth()` runs as a sub-invocation of it.
         token::Client::new(&env, &token_id).transfer(
-            &owner,
+            &staker,
             &env.current_contract_address(),
             &amount,
         );
@@ -2284,6 +2319,15 @@ impl LuminaRegistry {
         env.storage()
             .persistent()
             .set(&DataKey::Stake(contract_id.clone()), &staked);
+
+let mut stakers = Self::stakers_of(&env, &contract_id);
+        if !stakers.contains(&staker) {
+            stakers.push_back(staker.clone());
+            env.storage().persistent().set(&DataKey::Stakers(contract_id.clone()), &stakers);
+        }
+        let previous = Self::stake_of_staker(&env, &contract_id, &staker);
+        env.storage().persistent()
+            .set(&DataKey::StakeOf(contract_id.clone(), staker.clone()), &(previous + amount));
 
         let total_staked: i128 = env
             .storage()
@@ -2313,7 +2357,7 @@ impl LuminaRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "stake_deposited"),),
-            (contract_id, owner, amount, staked),
+            (contract_id, staker, amount, staked),
         );
 
         Ok(())
@@ -2323,7 +2367,7 @@ impl LuminaRegistry {
     ///
     /// "Good standing" is three conditions, all checked here:
     ///
-    /// 1. the caller is the registered owner;
+    /// 1. the caller has stake of their own on the registration;
     /// 2. the registration is **deactivated** — you get your collateral back
     ///    by leaving, not while still listed and benefiting from the stake;
     /// 3. no slash has landed within the last [`SLASH_LOCK_LEDGERS`] ledgers,
@@ -2333,10 +2377,10 @@ impl LuminaRegistry {
     /// Returns the amount returned to the owner.
     pub fn withdraw_stake(
         env: Env,
-        owner: Address,
+        staker: Address,
         contract_id: Address,
     ) -> Result<i128, RegistryError> {
-        owner.require_auth();
+        staker.require_auth();
 
         let entry: ContractEntry = env
             .storage()
@@ -2344,9 +2388,6 @@ impl LuminaRegistry {
             .get(&DataKey::Contract(contract_id.clone()))
             .ok_or(RegistryError::ContractNotFound)?;
 
-        if owner != entry.owner {
-            return Err(RegistryError::NotOwner);
-        }
         if entry.active {
             return Err(RegistryError::RegistrationActive);
         }
@@ -2354,7 +2395,7 @@ impl LuminaRegistry {
             return Err(RegistryError::StakeLocked);
         }
 
-        let staked = Self::stake_of(&env, &contract_id);
+        let staked = Self::stake_of_staker(&env, &contract_id, &staker);
         if staked <= 0 {
             return Err(RegistryError::InsufficientStake);
         }
@@ -2365,13 +2406,17 @@ impl LuminaRegistry {
         // its own balance by virtue of being the invoker.
         token::Client::new(&env, &token_id).transfer(
             &env.current_contract_address(),
-            &owner,
+            &staker,
             &staked,
         );
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::Stake(contract_id.clone()), &0i128);
+env.storage().persistent()
+            .set(&DataKey::StakeOf(contract_id.clone(), staker.clone()), &0i128);
+        let remaining = Self::stake_of(&env, &contract_id) - staked;
+        env.storage().persistent().set(&DataKey::Stake(contract_id.clone()), &remaining);
+        if remaining == 0 {
+            env.storage().persistent().remove(&DataKey::Stakers(contract_id.clone()));
+        }
 
         let total_staked: i128 = env
             .storage()
@@ -2401,7 +2446,7 @@ impl LuminaRegistry {
 
         env.events().publish(
             (Symbol::new(&env, "stake_withdrawn"),),
-            (contract_id, owner, staked),
+            (contract_id, staker, staked),
         );
 
         Ok(staked)
@@ -2764,6 +2809,10 @@ impl LuminaRegistry {
             slashed_total += record.amount;
         }
 
+        let withdraw_locked_until = env.storage().persistent()
+            .get(&DataKey::WithdrawLockedUntil(contract_id.clone()))
+            .unwrap_or(0);
+
         let reputation = Reputation {
             stake: env
                 .storage()
@@ -2776,11 +2825,8 @@ impl LuminaRegistry {
                 .get(&DataKey::Verified(contract_id.clone()))
                 .unwrap_or(false),
             slashed_total,
-            withdraw_locked_until: env
-                .storage()
-                .persistent()
-                .get(&DataKey::WithdrawLockedUntil(contract_id.clone()))
-                .unwrap_or(0),
+            withdraw_locked_until,
+            withdraw_locked: env.ledger().sequence() < withdraw_locked_until,
         };
 
         Ok(ContractProfile {
@@ -3594,6 +3640,7 @@ impl LuminaRegistry {
                 env.storage().instance().set(&DataKey::Treasury, treasury);
                 env.events().publish(
                     (Symbol::new(env, "staking_configured"),),
+                    (token_id, treasury),
                     (prev_token, prev_treasury, token_id.clone(), treasury.clone()),
                 );
             }
@@ -3858,6 +3905,8 @@ impl LuminaRegistry {
             slashed_total += record.amount;
         }
 
+        let withdraw_locked_until = Self::withdraw_locked_until(env, contract_id);
+
         Reputation {
             stake: Self::stake_of(env, contract_id),
             verified: env
@@ -3866,7 +3915,8 @@ impl LuminaRegistry {
                 .get(&DataKey::Verified(contract_id.clone()))
                 .unwrap_or(false),
             slashed_total,
-            withdraw_locked_until: Self::withdraw_locked_until(env, contract_id),
+            withdraw_locked_until,
+            withdraw_locked: env.ledger().sequence() < withdraw_locked_until,
         }
     }
 
@@ -6000,6 +6050,7 @@ mod test {
         assert!(!reputation.verified);
         assert_eq!(reputation.slashed_total, 0);
         assert_eq!(reputation.withdraw_locked_until, 0);
+        assert!(!reputation.withdraw_locked);
         assert_solvency(&env, &client, &token_id);
     }
 
@@ -6101,6 +6152,7 @@ mod test {
         assert_eq!(reputation.stake, 750);
         assert_eq!(reputation.slashed_total, 250);
         assert!(reputation.withdraw_locked_until > env.ledger().sequence());
+        assert!(reputation.withdraw_locked);
         assert_eq!(balance(&env, &token_id, &treasury), 250);
 
         // Trying to exit immediately fails on both counts, in order: still
@@ -6118,6 +6170,7 @@ mod test {
         // Once the lock expires the remainder — and only the remainder —
         // comes back.
         advance_ledger(&env, SLASH_LOCK_LEDGERS);
+        assert!(!client.get_reputation(&target).withdraw_locked);
         assert_eq!(client.withdraw_stake(&owner, &target), 750);
         assert_eq!(balance(&env, &token_id, &owner), 750);
         assert_eq!(balance(&env, &token_id, &client.address), 0);

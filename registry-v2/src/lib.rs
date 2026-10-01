@@ -65,7 +65,9 @@ pub enum RegistryError {
     /// Referenced contract was not found.
     ContractNotFound = 4,
     /// The registry has no admin set.
-    NotInitialized = 7,
+NotInitialized   = 7,
+    /// Stake accounting would overflow i128.
+    StakeOverflow    = 8,
 }
 
 /// Byte-compatible with `lumina_registry::ContractEntry`.
@@ -107,11 +109,25 @@ pub enum DataKey {
     OwnerContracts(Address),
     /// List of all registered contract addresses.
     AllContracts,
+    /// Resumable cursor for an in-progress category migration.
+    MigrationCursor,
 }
 
 /// Upgraded v2 registry contract target used for upgrade testing.
 #[contract]
 pub struct LuminaRegistryV2;
+
+/// Event emitted when a category remap migration completes.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CategoryRemapped {
+    /// The category variant being migrated away from.
+    pub from_category: u32,
+    /// The category variant being migrated to.
+    pub to_category: u32,
+    /// Number of registrations remapped in this call.
+    pub remapped: u32,
+}
 
 /// Compile-time guard: the fixture's `ContractEntry` must have the same field
 /// names and types as the real one. This mirrors the runtime check in the
